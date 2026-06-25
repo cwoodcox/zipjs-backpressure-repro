@@ -119,13 +119,14 @@ function makeR2Sink(mpu, { backpressured, onProduced, onConsumed, onProgress }) 
 // Also exceeds the 30 ms CPU time limit on deployed edge — run locally.
 
 async function runGetData(emit, env) {
+	const start = Date.now();
+	const elapsed = () => (Date.now() - start) / 1000;
+
 	const blob      = await getZipBlob(env);
 	const zipReader = new ZipReader(new BlobReader(blob));
 	const [entry]   = await zipReader.getEntries();
 
 	let produced = 0, consumed = 0;
-	const start = Date.now();
-	const elapsed = () => (Date.now() - start) / 1000;
 
 	// write() returns undefined → getData inflates the full entry synchronously.
 	// All decompressed chunks accumulate in `chunks` before any R2 write starts.
@@ -176,13 +177,14 @@ async function runGetData(emit, env) {
 // it advances only as fast as the sink drains — produced tracks consumed.
 
 async function runFixed(emit, env) {
+	const start = Date.now();
+	const elapsed = () => (Date.now() - start) / 1000;
+
 	const blob      = await getZipBlob(env);
 	const zipReader = new ZipReaderFixed(new BlobReaderFixed(blob));
 	const [entry]   = await zipReader.getEntries();
 
 	let produced = 0, consumed = 0;
-	const start = Date.now();
-	const elapsed = () => (Date.now() - start) / 1000;
 
 	const outKey = `output/fixed-${Math.random().toString(36).slice(2, 8)}.bin`;
 	const mpu = await env.DATA.createMultipartUpload(outKey);
@@ -210,6 +212,9 @@ async function runFixed(emit, env) {
 // the sink. Produced and consumed track each other throughout — no backlog.
 
 async function runDirect(emit, env) {
+	const start = Date.now();
+	const elapsed = () => (Date.now() - start) / 1000;
+
 	const blob = await getZipBlob(env);
 
 	const zipReader          = new ZipReader(new BlobReader(blob));
@@ -221,8 +226,6 @@ async function runDirect(emit, env) {
 		throw new Error(`unexpected compression method ${method} (expected 8 = deflate)`);
 
 	let produced = 0, consumed = 0;
-	const start = Date.now();
-	const elapsed = () => (Date.now() - start) / 1000;
 
 	const CHUNK = 64 * 1024;
 	const compressedData = blob.slice(dataOffset, dataOffset + compressedSize);
