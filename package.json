@@ -1,0 +1,26 @@
+{
+  "name": "zipjs-backpressure-repro",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cwoodcox/zipjs-backpressure-repro.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/cwoodcox/zipjs-backpressure-repro/issues"
+  },
+  "homepage": "https://github.com/cwoodcox/zipjs-backpressure-repro#readme",
+  "dependencies": {
+    "@zip.js/zip.js": "^2.8.26",
+    "wrangler": "^4.105.0"
+  }
+}

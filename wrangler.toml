@@ -1,0 +1,8 @@
+name = "zipjs-backpressure-repro"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+account_id = "73253249f21f63e49ae3662709f5fa8b"
+
+[[r2_buckets]]
+binding = "DATA"
+bucket_name = "zipjs-repro-data"

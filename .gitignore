@@ -1,0 +1,4 @@
+node_modules/
+.wrangler/
+large.zip
+worker-zip-data.js
