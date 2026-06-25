@@ -265,8 +265,11 @@ function buildHtml(entryMb) {
   The gap between
   <span style="color:#388bfd">produced</span> and
   <span style="color:#3fb950">consumed</span>
-  is live memory held in the pipeline.
-  On a 128 MB Workers isolate, entries above ∼2.7 GB cause OOM in the left panel.
+  is live memory held in the process.<br>
+  <em>Runs in local <code>wrangler dev</code> (no memory cap) — so the left panel
+  completes even with 512 MB in flight. On a deployed Workers isolate (128 MB hard
+  limit) that gap crossing ~128 MB causes an OOM crash; with the default 64 KB chunk
+  size getData() hits that ceiling at entries above ~2.7 GB.</em>
 </p>
 
 <div class="grid">
@@ -363,21 +366,25 @@ function run(mode) {
     ctx.clearRect(0, 0, W, H);
     if (pts.length < 2) return;
     const latest = pts[pts.length - 1];
-    const tMax = Math.max(latest.t, EXPECTED_SECS * 1.05, 0.1);
-    const x = (t)  => (t  / tMax)    * W;
-    const y = (mb) => H - (mb / ENTRY_MB) * H;
+    const tMax  = Math.max(latest.t, EXPECTED_SECS * 1.05, 0.1);
+    // 15% headroom so the produced line (often at ENTRY_MB) stays visible
+    const Y_MAX = ENTRY_MB / 0.85;
+    const x = (t)  => (t  / tMax)  * W;
+    const y = (mb) => H - (mb / Y_MAX) * H;
 
+    // grid lines at 25/50/75/100% of ENTRY_MB; 100% line in blue-tint
     ctx.lineWidth = 1;
-    for (let i = 1; i <= 3; i++) {
-      const yy = H * (1 - i / 4);
-      ctx.strokeStyle = '#21262d';
+    for (let i = 1; i <= 4; i++) {
+      const mb = ENTRY_MB * i / 4;
+      const yy = y(mb);
+      ctx.strokeStyle = i === 4 ? 'rgba(56,139,253,.25)' : '#21262d';
       ctx.beginPath(); ctx.moveTo(0, yy); ctx.lineTo(W, yy); ctx.stroke();
-      const label = (ENTRY_MB * i / 4).toFixed(0) + ' MB';
-      ctx.fillStyle = '#484f58';
+      ctx.fillStyle = i === 4 ? 'rgba(56,139,253,.6)' : '#484f58';
       ctx.font = (9 * dpr) + 'px ui-monospace,monospace';
-      ctx.fillText(label, 4, yy - 3);
+      ctx.fillText(mb.toFixed(0) + ' MB', 4, yy - 3);
     }
 
+    // backlog fill (produced - consumed) — red
     ctx.beginPath();
     ctx.moveTo(x(pts[0].t), y(pts[0].produced));
     for (const p of pts) ctx.lineTo(x(p.t), y(p.produced));
@@ -386,6 +393,7 @@ function run(mode) {
     ctx.fillStyle = 'rgba(218,54,51,.35)';
     ctx.fill();
 
+    // consumed area — green
     ctx.beginPath();
     ctx.moveTo(x(pts[0].t), H);
     for (const p of pts) ctx.lineTo(x(p.t), y(p.consumed));
@@ -394,11 +402,15 @@ function run(mode) {
     ctx.fillStyle = 'rgba(63,185,80,.25)';
     ctx.fill();
 
+    // produced line — blue (drawn after fills so it's on top)
     ctx.beginPath();
+    ctx.moveTo(x(pts[0].t), y(pts[0].produced));
     for (const p of pts) ctx.lineTo(x(p.t), y(p.produced));
     ctx.strokeStyle = '#388bfd'; ctx.lineWidth = 2; ctx.stroke();
 
+    // consumed line — green
     ctx.beginPath();
+    ctx.moveTo(x(pts[0].t), y(pts[0].consumed));
     for (const p of pts) ctx.lineTo(x(p.t), y(p.consumed));
     ctx.strokeStyle = '#3fb950'; ctx.lineWidth = 2; ctx.stroke();
   }
