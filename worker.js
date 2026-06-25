@@ -121,6 +121,7 @@ function makeR2Sink(mpu, { backpressured, onProduced, onConsumed, onProgress }) 
 async function runGetData(emit, env) {
 	const start = Date.now();
 	const elapsed = () => (Date.now() - start) / 1000;
+	emit({ t: 0, produced: 0, consumed: 0 });
 
 	const blob      = await getZipBlob(env);
 	const zipReader = new ZipReader(new BlobReader(blob));
@@ -179,6 +180,7 @@ async function runGetData(emit, env) {
 async function runFixed(emit, env) {
 	const start = Date.now();
 	const elapsed = () => (Date.now() - start) / 1000;
+	emit({ t: 0, produced: 0, consumed: 0 });
 
 	const blob      = await getZipBlob(env);
 	const zipReader = new ZipReaderFixed(new BlobReaderFixed(blob));
@@ -214,6 +216,7 @@ async function runFixed(emit, env) {
 async function runDirect(emit, env) {
 	const start = Date.now();
 	const elapsed = () => (Date.now() - start) / 1000;
+	emit({ t: 0, produced: 0, consumed: 0 });
 
 	const blob = await getZipBlob(env);
 
@@ -435,6 +438,18 @@ function run(mode) {
       ctx.font = (9 * dpr) + 'px ui-monospace,monospace';
       ctx.fillText(mb.toFixed(0) + ' MB', 4, yy - 3);
     }
+
+    // Workers 128 MB hard memory limit
+    const limitY = y(128);
+    ctx.save();
+    ctx.setLineDash([5 * dpr, 4 * dpr]);
+    ctx.strokeStyle = 'rgba(218,54,51,.7)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(0, limitY); ctx.lineTo(W, limitY); ctx.stroke();
+    ctx.restore();
+    ctx.fillStyle = 'rgba(218,54,51,.9)';
+    ctx.font = (9 * dpr) + 'px ui-monospace,monospace';
+    ctx.fillText('128 MB workers limit', 4, limitY - 3);
 
     // backlog fill (produced - consumed) — red
     ctx.beginPath();
