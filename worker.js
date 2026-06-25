@@ -55,16 +55,16 @@ async function localDataOffset(blob, lfhOffset) {
 
 // ── SSE helper ────────────────────────────────────────────────────────────────
 
-function makeSSEResponse(ctx, handler) {
-	const { readable, writable } = new TransformStream();
-	const writer  = writable.getWriter();
-	const enc     = new TextEncoder();
-	const emit    = (obj) => writer.write(enc.encode(`data: ${JSON.stringify(obj)}\n\n`));
-	ctx.waitUntil(
-		handler(emit)
-			.catch((err) => emit({ error: String(err) }))
-			.finally(() => writer.close())
-	);
+function makeSSEResponse(handler) {
+	const enc = new TextEncoder();
+	let ctrl;
+	const readable = new ReadableStream({
+		start(c) { ctrl = c; },
+	});
+	const emit = (obj) => ctrl.enqueue(enc.encode(`data: ${JSON.stringify(obj)}\n\n`));
+	handler(emit)
+		.catch((err) => emit({ error: String(err) }))
+		.finally(() => ctrl.close());
 	return new Response(readable, {
 		headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" },
 	});
@@ -76,7 +76,7 @@ function makeSSEResponse(ctx, handler) {
 // backpressured=true  → write() returns the upload Promise (getData waits)
 // backpressured=false → write() returns undefined (getData never waits)
 
-function makeR2Sink(mpu, { backpressured, onProduced, onConsumed }) {
+function makeR2Sink(mpu, { backpressured, onProduced, onConsumed, onProgress }) {
 	const parts   = [];
 	const pending = []; // in-flight upload promises (non-backpressured mode only)
 	let buf = [], bufSize = 0, partNum = 1;
@@ -85,6 +85,7 @@ function makeR2Sink(mpu, { backpressured, onProduced, onConsumed }) {
 		const p = mpu.uploadPart(num, new Blob(chunks)).then(part => {
 			parts[num - 1] = part;
 			onConsumed(size);
+			if (onProgress) onProgress();
 		});
 		return p;
 	}
@@ -125,10 +126,6 @@ async function runGetData(emit, env) {
 	let produced = 0, consumed = 0;
 	const start = Date.now();
 	const elapsed = () => (Date.now() - start) / 1000;
-	const interval = setInterval(
-		() => emit({ t: elapsed(), produced: produced / 1e6, consumed: consumed / 1e6 }),
-		100,
-	);
 
 	// write() returns undefined → getData inflates the full entry synchronously.
 	// All decompressed chunks accumulate in `chunks` before any R2 write starts.
@@ -137,8 +134,10 @@ async function runGetData(emit, env) {
 		write(chunk) { produced += chunk.byteLength; chunks.push(chunk); },
 	}));
 
-	// Inflate complete. Now drain to R2 serially: consumed rises in PART_SIZE steps
-	// while the setInterval ticks show the produced–consumed gap closing.
+	// Emit once to show the full produced spike before any R2 writes begin.
+	emit({ t: elapsed(), produced: produced / 1e6, consumed: 0 });
+
+	// Drain to R2 serially — emit after each part so consumed rises visibly.
 	const outKey = `output/getdata-${Math.random().toString(36).slice(2, 8)}.bin`;
 	const mpu = await env.DATA.createMultipartUpload(outKey);
 	try {
@@ -150,6 +149,7 @@ async function runGetData(emit, env) {
 				parts.push(await mpu.uploadPart(partNum++, new Blob(buf)));
 				consumed += bufSize;
 				buf = []; bufSize = 0;
+				emit({ t: elapsed(), produced: produced / 1e6, consumed: consumed / 1e6 });
 			}
 		}
 		if (bufSize > 0) {
@@ -161,7 +161,6 @@ async function runGetData(emit, env) {
 		await mpu.abort().catch(() => {});
 		throw err;
 	} finally {
-		clearInterval(interval);
 		await env.DATA.delete(outKey).catch(() => {});
 	}
 
@@ -184,10 +183,6 @@ async function runFixed(emit, env) {
 	let produced = 0, consumed = 0;
 	const start = Date.now();
 	const elapsed = () => (Date.now() - start) / 1000;
-	const interval = setInterval(
-		() => emit({ t: elapsed(), produced: produced / 1e6, consumed: consumed / 1e6 }),
-		100,
-	);
 
 	const outKey = `output/fixed-${Math.random().toString(36).slice(2, 8)}.bin`;
 	const mpu = await env.DATA.createMultipartUpload(outKey);
@@ -196,12 +191,12 @@ async function runFixed(emit, env) {
 			backpressured: true,
 			onProduced: (n) => { produced += n; },
 			onConsumed: (n) => { consumed += n; },
+			onProgress: () => emit({ t: elapsed(), produced: produced / 1e6, consumed: consumed / 1e6 }),
 		}));
 	} catch (err) {
 		await mpu.abort().catch(() => {});
 		throw err;
 	} finally {
-		clearInterval(interval);
 		await env.DATA.delete(outKey).catch(() => {});
 	}
 
@@ -229,11 +224,6 @@ async function runDirect(emit, env) {
 	const start = Date.now();
 	const elapsed = () => (Date.now() - start) / 1000;
 
-	const interval = setInterval(
-		() => emit({ t: elapsed(), produced: produced / 1e6, consumed: consumed / 1e6 }),
-		100,
-	);
-
 	const CHUNK = 64 * 1024;
 	const compressedData = blob.slice(dataOffset, dataOffset + compressedSize);
 	let offset = 0;
@@ -255,12 +245,12 @@ async function runDirect(emit, env) {
 				backpressured: true,
 				onProduced: (n) => { produced += n; },
 				onConsumed: (n) => { consumed += n; },
+				onProgress: () => emit({ t: elapsed(), produced: produced / 1e6, consumed: consumed / 1e6 }),
 			}));
 	} catch (err) {
 		await mpu.abort().catch(() => {});
 		throw err;
 	} finally {
-		clearInterval(interval);
 		await env.DATA.delete(outKey).catch(() => {});
 	}
 
@@ -482,15 +472,15 @@ function run(mode) {
 // ── router ────────────────────────────────────────────────────────────────────
 
 export default {
-	async fetch(request, env, ctx) {
+	async fetch(request, env) {
 		const { pathname } = new URL(request.url);
 		if (pathname === "/") {
 			const { entryMb } = await getEntryMeta(env);
 			return new Response(buildHtml(entryMb), { headers: { "Content-Type": "text/html" } });
 		}
-		if (pathname === "/run/getdata") return makeSSEResponse(ctx, (emit) => runGetData(emit, env));
-		if (pathname === "/run/fixed")   return makeSSEResponse(ctx, (emit) => runFixed(emit, env));
-		if (pathname === "/run/direct")  return makeSSEResponse(ctx, (emit) => runDirect(emit, env));
-		return new Response("Not found", { status: 404 });
+		if (pathname === "/run/getdata") return makeSSEResponse((emit) => runGetData(emit, env));
+		if (pathname === "/run/fixed")   return makeSSEResponse((emit) => runFixed(emit, env));
+		if (pathname === "/run/direct")  return makeSSEResponse((emit) => runDirect(emit, env));
+return new Response("Not found", { status: 404 });
 	},
 };
