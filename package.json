@@ -22,6 +22,6 @@
   "dependencies": {
     "@zip.js/zip.js": "^2.8.26",
     "wrangler": "^4.105.0",
-    "zip-js-fixed": "file:../zip.js"
+    "zip-js-fixed": "github:cwoodcox/zip.js#fix/getdata-backpressure-byte-length-queuing"
   }
 }
