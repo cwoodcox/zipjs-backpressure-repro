@@ -55,14 +55,16 @@ async function localDataOffset(blob, lfhOffset) {
 
 // ── SSE helper ────────────────────────────────────────────────────────────────
 
-function makeSSEResponse(handler) {
+function makeSSEResponse(ctx, handler) {
 	const { readable, writable } = new TransformStream();
 	const writer  = writable.getWriter();
 	const enc     = new TextEncoder();
 	const emit    = (obj) => writer.write(enc.encode(`data: ${JSON.stringify(obj)}\n\n`));
-	handler(emit)
-		.catch((err) => emit({ error: String(err) }))
-		.finally(() => writer.close());
+	ctx.waitUntil(
+		handler(emit)
+			.catch((err) => emit({ error: String(err) }))
+			.finally(() => writer.close())
+	);
 	return new Response(readable, {
 		headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" },
 	});
@@ -423,15 +425,15 @@ function run(mode) {
 // ── router ────────────────────────────────────────────────────────────────────
 
 export default {
-	async fetch(request, env) {
+	async fetch(request, env, ctx) {
 		const { pathname } = new URL(request.url);
 		if (pathname === "/") {
 			const { entryMb } = await getEntryMeta(env);
 			return new Response(buildHtml(entryMb), { headers: { "Content-Type": "text/html" } });
 		}
-		if (pathname === "/run/getdata") return makeSSEResponse((emit) => runGetData(emit, env));
-		if (pathname === "/run/fixed")   return makeSSEResponse((emit) => runFixed(emit, env));
-		if (pathname === "/run/direct")  return makeSSEResponse((emit) => runDirect(emit, env));
+		if (pathname === "/run/getdata") return makeSSEResponse(ctx, (emit) => runGetData(emit, env));
+		if (pathname === "/run/fixed")   return makeSSEResponse(ctx, (emit) => runFixed(emit, env));
+		if (pathname === "/run/direct")  return makeSSEResponse(ctx, (emit) => runDirect(emit, env));
 		return new Response("Not found", { status: 404 });
 	},
 };
