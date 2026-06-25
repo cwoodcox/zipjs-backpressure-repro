@@ -21,6 +21,7 @@
   "homepage": "https://github.com/cwoodcox/zipjs-backpressure-repro#readme",
   "dependencies": {
     "@zip.js/zip.js": "^2.8.26",
-    "wrangler": "^4.105.0"
+    "wrangler": "^4.105.0",
+    "zip-js-fixed": "file:../zip.js"
   }
 }
