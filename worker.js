@@ -113,10 +113,11 @@ function makeR2Sink(mpu, { backpressured, onProduced, onConsumed, onProgress }) 
 
 // ── /run/getdata ──────────────────────────────────────────────────────────────
 //
-// Uses current npm getData() with a non-backpressuring sink.
-// getData inflates the entire entry synchronously before any R2 write begins.
-// On a 128 MB Workers isolate, entries above ~2.7 GB OOM here.
-// Also exceeds the 30 ms CPU time limit on deployed edge — run locally.
+// Uses current npm getData() with the SAME real backpressured R2 sink as
+// runFixed.  This is the correct comparison: same sink, different zip.js build.
+// If getData() honours the WritableStream's backpressure, produced ≈ consumed
+// throughout and the chart looks like the patched panel.
+// If it ignores backpressure, produced races ahead and a backlog builds.
 
 async function runGetData(emit, env) {
 	const start = Date.now();
@@ -129,36 +130,15 @@ async function runGetData(emit, env) {
 
 	let produced = 0, consumed = 0;
 
-	// write() returns undefined → getData inflates the full entry synchronously.
-	// All decompressed chunks accumulate in `chunks` before any R2 write starts.
-	const chunks = [];
-	await entry.getData(new WritableStream({
-		write(chunk) { produced += chunk.byteLength; chunks.push(chunk); },
-	}));
-
-	// Emit once to show the full produced spike before any R2 writes begin.
-	emit({ t: elapsed(), produced: produced / 1e6, consumed: 0 });
-
-	// Drain to R2 serially — emit after each part so consumed rises visibly.
 	const outKey = `output/getdata-${Math.random().toString(36).slice(2, 8)}.bin`;
 	const mpu = await env.DATA.createMultipartUpload(outKey);
 	try {
-		let buf = [], bufSize = 0, partNum = 1;
-		const parts = [];
-		for (const chunk of chunks) {
-			buf.push(chunk); bufSize += chunk.byteLength;
-			if (bufSize >= PART_SIZE) {
-				parts.push(await mpu.uploadPart(partNum++, new Blob(buf)));
-				consumed += bufSize;
-				buf = []; bufSize = 0;
-				emit({ t: elapsed(), produced: produced / 1e6, consumed: consumed / 1e6 });
-			}
-		}
-		if (bufSize > 0) {
-			parts.push(await mpu.uploadPart(partNum++, new Blob(buf)));
-			consumed += bufSize;
-		}
-		await mpu.complete(parts);
+		await entry.getData(makeR2Sink(mpu, {
+			backpressured: true,
+			onProduced: (n) => { produced += n; },
+			onConsumed: (n) => { consumed += n; },
+			onProgress: () => emit({ t: elapsed(), produced: produced / 1e6, consumed: consumed / 1e6 }),
+		}));
 	} catch (err) {
 		await mpu.abort().catch(() => {});
 		throw err;
@@ -317,23 +297,21 @@ function buildHtml(entryMb) {
 <h1>zip.js <code>entry.getData()</code> — backpressure demo</h1>
 <p class="sub">
   All three runs extract a <strong>${entryMb} MB</strong> entry from the same ZIP
-  and write the decompressed bytes to R2 (multipart upload).<br>
+  and write the decompressed bytes to the same real backpressured R2 sink.<br>
   The gap between
   <span style="color:#388bfd">produced</span> and
   <span style="color:#3fb950">consumed</span>
   is live memory held in the process.<br>
-  <em>Left panel: <code>getData()</code> inflates synchronously — the full entry
-  accumulates in JS heap before any R2 write begins. On a deployed Workers isolate
-  (128 MB hard limit) this OOMs for entries above ~2.7 GB; it also exceeds the 30 ms
-  CPU time limit, so the left panel works best in local <code>wrangler dev</code>.
-  The middle and right panels yield the event loop every R2 part and work when deployed.</em>
+  <em>Left = current npm getData() with a backpressured sink — does it respect it?
+  Middle = patched (ByteLengthQS) with same sink.
+  Right = native DecompressionStream, same sink.</em>
 </p>
 
 <div class="grid">
   <div class="card">
     <p class="card-title">
       <code>getData(writable)</code>
-      <span class="badge badge-bug">current — unbounded</span>
+      <span class="badge badge-bug">current — npm</span>
     </p>
     <canvas id="c-getdata"></canvas>
     <div class="legend">
@@ -352,7 +330,9 @@ function buildHtml(entryMb) {
     </p>
     <canvas id="c-fixed"></canvas>
     <div class="legend">
-      <span><span class="dot" style="background:#3fb950"></span>consumed (= produced)</span>
+      <span><span class="dot" style="background:#388bfd"></span>produced</span>
+      <span><span class="dot" style="background:#3fb950"></span>consumed</span>
+      <span><span class="dot" style="background:#da3633"></span>backlog</span>
     </div>
     <div class="stat" id="stat-fixed">—</div>
     <button id="btn-fixed" onclick="run('fixed')">Run patched</button>
