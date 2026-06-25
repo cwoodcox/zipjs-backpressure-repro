@@ -1,23 +1,25 @@
 #!/usr/bin/env node
-// Generates the test ZIP and writes large.zip for upload to R2.
-// Run once: node generate-zip.mjs
-// Then upload: npx wrangler r2 object put zipjs-repro-data/large.zip --file large.zip --remote
+// Usage: node generate-zip.mjs [entry_mb [noise_period [dest_key]]]
 //
-// The ZIP has a single entry ("large.bin") of ENTRY_MB megabytes.
-// Data is every NOISE_PERIOD-th byte random (XorShift32), the rest zeros.
-// At NOISE_PERIOD=8 this gives ~8:1 compression — the .zip is ~65 MB rather
-// than the ~522 KB produced by all-zeros.  A less extreme compression ratio
-// better reflects real-world archives and avoids inflating from a trivially
-// small source (zeros let getData() run to completion almost instantly, which
-// is worse than any real file would be).
+//   entry_mb     decompressed entry size in MB          (default 1024)
+//   noise_period 1 in N bytes is random, rest zeros     (default 5  → ~5:1 compression)
+//   dest_key     R2 object key in zipjs-repro-data       (default large.zip)
+//
+// Generates the ZIP in memory then uploads it directly to R2 via wrangler.
 
 import { BlobWriter, ZipWriter } from "@zip.js/zip.js";
-import { writeFileSync } from "fs";
+import { spawnSync } from "child_process";
 
-const ENTRY_MB     = 512;
-const NOISE_PERIOD = 8; // 1 in NOISE_PERIOD bytes is pseudo-random → ~8:1 ratio
+const [, , argMb, argNoise, argKey] = process.argv;
+const ENTRY_MB     = argMb    ? parseInt(argMb,    10) : 1024;
+const NOISE_PERIOD = argNoise ? parseInt(argNoise, 10) : 5;
+const DEST_KEY     = argKey  ?? "large.zip";
+const BUCKET       = "zipjs-repro-data";
 
-console.log(`generating ${ENTRY_MB} MB ZIP (~${Math.round(ENTRY_MB / NOISE_PERIOD)} MB compressed)…`);
+if (isNaN(ENTRY_MB) || ENTRY_MB <= 0) { console.error("entry_mb must be a positive integer"); process.exit(1); }
+if (isNaN(NOISE_PERIOD) || NOISE_PERIOD <= 0) { console.error("noise_period must be a positive integer"); process.exit(1); }
+
+console.log(`generating ${ENTRY_MB} MB entry, noise_period=${NOISE_PERIOD} (~${Math.round(ENTRY_MB / NOISE_PERIOD)} MB compressed), key=${DEST_KEY}…`);
 
 // XorShift32 — deterministic, no external dependency
 let xstate = 0xDEADBEEF;
@@ -29,8 +31,8 @@ function xs32() {
 }
 
 const buf = new Uint8Array(64 * 1024);
-let remaining  = ENTRY_MB * 1024 * 1024;
-let byteIndex  = 0;
+let remaining = ENTRY_MB * 1024 * 1024;
+let byteIndex = 0;
 
 const source = new ReadableStream({
 	pull(controller) {
@@ -40,7 +42,7 @@ const source = new ReadableStream({
 			buf[i] = (byteIndex % NOISE_PERIOD === 0) ? (xs32() & 0xff) : 0;
 			byteIndex++;
 		}
-		controller.enqueue(buf.slice(0, n)); // slice copies — buf is reused each pull
+		controller.enqueue(buf.slice(0, n));
 		remaining -= n;
 	},
 });
@@ -50,8 +52,19 @@ const zipWriter  = new ZipWriter(blobWriter);
 await zipWriter.add("large.bin", source);
 await zipWriter.close();
 const blob  = await blobWriter.getData();
-const bytes = new Uint8Array(await blob.arrayBuffer());
+const bytes = Buffer.from(await blob.arrayBuffer());
 
-writeFileSync("large.zip", bytes);
-console.log(`done: ${bytes.length} bytes (${(bytes.length / 1024 / 1024).toFixed(1)} MB) → large.zip`);
-console.log(`upload: npx wrangler r2 object put zipjs-repro-data/large.zip --file large.zip --remote`);
+console.log(`compressed: ${(bytes.length / 1024 / 1024).toFixed(1)} MB — uploading to ${BUCKET}/${DEST_KEY}…`);
+
+const result = spawnSync(
+	"npx", ["wrangler", "r2", "object", "put", `${BUCKET}/${DEST_KEY}`,
+	        "--pipe", "--content-type", "application/zip", "--remote"],
+	{ input: bytes, stdio: ["pipe", "inherit", "inherit"] },
+);
+
+if (result.status !== 0) {
+	console.error(`upload failed (exit ${result.status})`);
+	process.exit(result.status ?? 1);
+}
+
+console.log(`done: ${BUCKET}/${DEST_KEY}`);
