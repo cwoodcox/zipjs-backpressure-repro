@@ -25,7 +25,7 @@ import { BlobReader as BlobReaderFixed, ZipReader as ZipReaderFixed, configure a
 configure({ useWebWorkers: false });
 configureFixed({ useWebWorkers: false });
 
-const DRAIN_RATE_MBPS = 50; // simulated destination write speed (MB/s)
+const PART_SIZE = 5 * 1024 * 1024; // R2 multipart minimum part size (last part may be smaller)
 
 // ── fetch ZIP blob from R2 ────────────────────────────────────────────────────
 
@@ -70,11 +70,52 @@ function makeSSEResponse(ctx, handler) {
 	});
 }
 
+// ── R2 multipart sink ─────────────────────────────────────────────────────────
+//
+// Buffers chunks to PART_SIZE then uploads one R2 multipart part.
+// backpressured=true  → write() returns the upload Promise (getData waits)
+// backpressured=false → write() returns undefined (getData never waits)
+
+function makeR2Sink(mpu, { backpressured, onProduced, onConsumed }) {
+	const parts   = [];
+	const pending = []; // in-flight upload promises (non-backpressured mode only)
+	let buf = [], bufSize = 0, partNum = 1;
+
+	function startPart(chunks, size, num) {
+		const p = mpu.uploadPart(num, new Blob(chunks)).then(part => {
+			parts[num - 1] = part;
+			onConsumed(size);
+		});
+		return p;
+	}
+
+	return new WritableStream({
+		write(chunk) {
+			onProduced(chunk.byteLength);
+			buf.push(chunk);
+			bufSize += chunk.byteLength;
+			if (bufSize >= PART_SIZE) {
+				const p = startPart(buf, bufSize, partNum++);
+				buf = []; bufSize = 0;
+				if (backpressured) return p;
+				else pending.push(p);
+			}
+		},
+		async flush() {
+			if (buf.length) await startPart(buf, bufSize, partNum++);
+			if (pending.length) await Promise.all(pending);
+			await mpu.complete(parts.filter(Boolean));
+		},
+		async abort() { await mpu.abort().catch(() => {}); },
+	});
+}
+
 // ── /run/getdata ──────────────────────────────────────────────────────────────
 //
 // Uses current npm getData() with a non-backpressuring sink.
-// getData inflates the entire 512 MB before the drain loop processes a byte.
+// getData inflates the entire entry synchronously before any R2 write begins.
 // On a 128 MB Workers isolate, entries above ~2.7 GB OOM here.
+// Also exceeds the 30 ms CPU time limit on deployed edge — run locally.
 
 async function runGetData(emit, env) {
 	const blob      = await getZipBlob(env);
@@ -84,34 +125,46 @@ async function runGetData(emit, env) {
 	let produced = 0, consumed = 0;
 	const start = Date.now();
 	const elapsed = () => (Date.now() - start) / 1000;
-
 	const interval = setInterval(
 		() => emit({ t: elapsed(), produced: produced / 1e6, consumed: consumed / 1e6 }),
 		100,
 	);
 
-	// Non-backpressuring sink: write() returns undefined → getData never waits.
-	// Inflates at full speed; drain runs after inflate is complete.
-	const getDataDone = entry.getData(new WritableStream({
-		write(chunk) { produced += chunk.byteLength; },
+	// write() returns undefined → getData inflates the full entry synchronously.
+	// All decompressed chunks accumulate in `chunks` before any R2 write starts.
+	const chunks = [];
+	await entry.getData(new WritableStream({
+		write(chunk) { produced += chunk.byteLength; chunks.push(chunk); },
 	}));
 
-	let inflateFinished = false;
-	getDataDone.finally(() => { inflateFinished = true; });
-
-	const DRAIN_CHUNK = 1 * 1024 * 1024;
-	while (!inflateFinished || consumed < produced) {
-		if (consumed >= produced) {
-			await new Promise((r) => setTimeout(r, 10));
-			continue;
+	// Inflate complete. Now drain to R2 serially: consumed rises in PART_SIZE steps
+	// while the setInterval ticks show the produced–consumed gap closing.
+	const outKey = `output/getdata-${Math.random().toString(36).slice(2, 8)}.bin`;
+	const mpu = await env.DATA.createMultipartUpload(outKey);
+	try {
+		let buf = [], bufSize = 0, partNum = 1;
+		const parts = [];
+		for (const chunk of chunks) {
+			buf.push(chunk); bufSize += chunk.byteLength;
+			if (bufSize >= PART_SIZE) {
+				parts.push(await mpu.uploadPart(partNum++, new Blob(buf)));
+				consumed += bufSize;
+				buf = []; bufSize = 0;
+			}
 		}
-		const n = Math.min(DRAIN_CHUNK, produced - consumed);
-		await new Promise((r) => setTimeout(r, n / (DRAIN_RATE_MBPS * 1e6) * 1000));
-		consumed += n;
+		if (bufSize > 0) {
+			parts.push(await mpu.uploadPart(partNum++, new Blob(buf)));
+			consumed += bufSize;
+		}
+		await mpu.complete(parts);
+	} catch (err) {
+		await mpu.abort().catch(() => {});
+		throw err;
+	} finally {
+		clearInterval(interval);
+		await env.DATA.delete(outKey).catch(() => {});
 	}
 
-	await getDataDone;
-	clearInterval(interval);
 	emit({ t: elapsed(), produced: produced / 1e6, consumed: consumed / 1e6, done: true });
 	await zipReader.close();
 }
@@ -131,26 +184,27 @@ async function runFixed(emit, env) {
 	let produced = 0, consumed = 0;
 	const start = Date.now();
 	const elapsed = () => (Date.now() - start) / 1000;
-
 	const interval = setInterval(
 		() => emit({ t: elapsed(), produced: produced / 1e6, consumed: consumed / 1e6 }),
 		100,
 	);
 
-	// Real backpressured sink: write() returns a Promise that resolves after the
-	// simulated drain delay. The fix ensures getData waits for each write to
-	// complete before inflating more data.
-	await entry.getData(new WritableStream({
-		write(chunk) {
-			produced += chunk.byteLength;
-			consumed += chunk.byteLength;
-			return new Promise((r) =>
-				setTimeout(r, chunk.byteLength / (DRAIN_RATE_MBPS * 1e6) * 1000)
-			);
-		},
-	}));
+	const outKey = `output/fixed-${Math.random().toString(36).slice(2, 8)}.bin`;
+	const mpu = await env.DATA.createMultipartUpload(outKey);
+	try {
+		await entry.getData(makeR2Sink(mpu, {
+			backpressured: true,
+			onProduced: (n) => { produced += n; },
+			onConsumed: (n) => { consumed += n; },
+		}));
+	} catch (err) {
+		await mpu.abort().catch(() => {});
+		throw err;
+	} finally {
+		clearInterval(interval);
+		await env.DATA.delete(outKey).catch(() => {});
+	}
 
-	clearInterval(interval);
 	emit({ t: elapsed(), produced: produced / 1e6, consumed: consumed / 1e6, done: true });
 	await zipReader.close();
 }
@@ -184,27 +238,32 @@ async function runDirect(emit, env) {
 	const compressedData = blob.slice(dataOffset, dataOffset + compressedSize);
 	let offset = 0;
 
-	await new ReadableStream({
-		async pull(controller) {
-			if (offset >= compressedSize) { controller.close(); return; }
-			const n  = Math.min(CHUNK, compressedSize - offset);
-			const ab = await compressedData.slice(offset, offset + n).arrayBuffer();
-			controller.enqueue(new Uint8Array(ab));
-			offset += n;
-		},
-	})
-		.pipeThrough(new DecompressionStream("deflate-raw"))
-		.pipeTo(new WritableStream({
-			write(chunk) {
-				produced += chunk.byteLength;
-				consumed += chunk.byteLength;
-				return new Promise((r) =>
-					setTimeout(r, chunk.byteLength / (DRAIN_RATE_MBPS * 1e6) * 1000)
-				);
+	const outKey = `output/direct-${Math.random().toString(36).slice(2, 8)}.bin`;
+	const mpu = await env.DATA.createMultipartUpload(outKey);
+	try {
+		await new ReadableStream({
+			async pull(controller) {
+				if (offset >= compressedSize) { controller.close(); return; }
+				const n  = Math.min(CHUNK, compressedSize - offset);
+				const ab = await compressedData.slice(offset, offset + n).arrayBuffer();
+				controller.enqueue(new Uint8Array(ab));
+				offset += n;
 			},
-		}));
+		})
+			.pipeThrough(new DecompressionStream("deflate-raw"))
+			.pipeTo(makeR2Sink(mpu, {
+				backpressured: true,
+				onProduced: (n) => { produced += n; },
+				onConsumed: (n) => { consumed += n; },
+			}));
+	} catch (err) {
+		await mpu.abort().catch(() => {});
+		throw err;
+	} finally {
+		clearInterval(interval);
+		await env.DATA.delete(outKey).catch(() => {});
+	}
 
-	clearInterval(interval);
 	emit({ t: elapsed(), produced: produced / 1e6, consumed: consumed / 1e6, done: true });
 }
 
@@ -261,17 +320,17 @@ function buildHtml(entryMb) {
 <body>
 <h1>zip.js <code>entry.getData()</code> — backpressure demo</h1>
 <p class="sub">
-  All three runs extract a <strong>${entryMb} MB</strong> entry from the same ZIP,
-  draining to a simulated <strong>${DRAIN_RATE_MBPS} MB/s</strong> destination
-  (e.g. an R2 write stream).<br>
+  All three runs extract a <strong>${entryMb} MB</strong> entry from the same ZIP
+  and write the decompressed bytes to R2 (multipart upload).<br>
   The gap between
   <span style="color:#388bfd">produced</span> and
   <span style="color:#3fb950">consumed</span>
   is live memory held in the process.<br>
-  <em>Runs in local <code>wrangler dev</code> (no memory cap) — so the left panel
-  completes even with 512 MB in flight. On a deployed Workers isolate (128 MB hard
-  limit) that gap crossing ~128 MB causes an OOM crash; with the default 64 KB chunk
-  size getData() hits that ceiling at entries above ~2.7 GB.</em>
+  <em>Left panel: <code>getData()</code> inflates synchronously — the full entry
+  accumulates in JS heap before any R2 write begins. On a deployed Workers isolate
+  (128 MB hard limit) this OOMs for entries above ~2.7 GB; it also exceeds the 30 ms
+  CPU time limit, so the left panel works best in local <code>wrangler dev</code>.
+  The middle and right panels yield the event loop every R2 part and work when deployed.</em>
 </p>
 
 <div class="grid">
@@ -324,9 +383,7 @@ function buildHtml(entryMb) {
 </div>
 
 <script>
-const ENTRY_MB      = ${entryMb};
-const DRAIN_RATE    = ${DRAIN_RATE_MBPS};
-const EXPECTED_SECS = ENTRY_MB / DRAIN_RATE;
+const ENTRY_MB = ${entryMb};
 
 function run(mode) {
   const canvas = document.getElementById('c-' + mode);
@@ -368,7 +425,7 @@ function run(mode) {
     ctx.clearRect(0, 0, W, H);
     if (pts.length < 2) return;
     const latest = pts[pts.length - 1];
-    const tMax  = Math.max(latest.t, EXPECTED_SECS * 1.05, 0.1);
+    const tMax  = Math.max(latest.t * 1.15, 5);
     // 15% headroom so the produced line (often at ENTRY_MB) stays visible
     const Y_MAX = ENTRY_MB / 0.85;
     const x = (t)  => (t  / tMax)  * W;
