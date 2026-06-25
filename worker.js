@@ -1,47 +1,47 @@
 /**
  * Minimum reproduction for the @zip.js/zip.js getData() backpressure issue.
  *
- * getData() inflates as fast as the compressed source allows, with no byte-based
- * bound on its internal transform chain. With a slow destination (e.g. R2 at
- * ~50 MB/s) the entire decompressed entry accumulates in memory. On the 128 MB
- * Cloudflare Workers hard cap this causes OOM for entries above ~2.7 GB.
- *
- * Three panels:
- *   /run/getdata  — current getData(), no backpressure on sink     (bug)
- *   /run/fixed    — patched getData() with real backpressured sink (fix)
- *   /run/direct   — native DecompressionStream, pull-paced         (workaround)
+ * Three panels run the same ZIP entry through three pipelines with the same
+ * real backpressured R2 multipart sink.  Panels differ only in the zip layer:
+ *   /run/getdata  — current npm getData()
+ *   /run/fixed    — patched getData() with ByteLengthQueuingStrategy
+ *   /run/direct   — native DecompressionStream (no zip.js wrapper)
  *
  * Setup:
- *   node generate-zip.mjs           # build large.zip (do once)
- *   npx wrangler r2 object put zipjs-repro-data/large.zip --file large.zip --remote
- *   npx wrangler dev                 # local dev
+ *   node generate-zip.mjs [entry_mb [noise_period [dest_key]]]
+ *   npx wrangler dev
  */
 
-// npm version — current released @zip.js/zip.js (exhibits the bug)
+// npm version — current released @zip.js/zip.js
 import { BlobReader, ZipReader, configure } from "@zip.js/zip.js";
-// local patched fork — ByteLengthQueuingStrategy on internal transforms (fix)
+// patched fork — ByteLengthQueuingStrategy on internal transforms
 import { BlobReader as BlobReaderFixed, ZipReader as ZipReaderFixed, configure as configureFixed } from "zip-js-fixed";
 
 configure({ useWebWorkers: false });
 configureFixed({ useWebWorkers: false });
 
-const PART_SIZE = 5 * 1024 * 1024; // R2 multipart minimum part size (last part may be smaller)
+const PART_SIZE = 5 * 1024 * 1024; // R2 multipart minimum (last part may be smaller)
 
-// ── fetch ZIP blob from R2 ────────────────────────────────────────────────────
+// ── R2 helpers ────────────────────────────────────────────────────────────────
 
-async function getZipBlob(env) {
-	const obj = await env.DATA.get("large.zip");
-	if (!obj) throw new Error("large.zip not found in R2 — run generate-zip.mjs and upload first");
-	const buf = await obj.arrayBuffer();
-	return new Blob([buf]);
+async function getZipBlob(env, key) {
+	const obj = await env.DATA.get(key);
+	if (!obj) throw new Error(`${key} not found in R2 — run generate-zip.mjs first`);
+	return new Blob([await obj.arrayBuffer()]);
 }
 
-// ── local file header: compute data offset only ───────────────────────────────
+async function listZipFiles(env) {
+	const { objects } = await env.DATA.list();
+	return objects
+		.filter(o => o.key.endsWith(".zip"))
+		.map(o => ({ key: o.key, size: o.size }))
+		.sort((a, b) => a.key.localeCompare(b.key));
+}
+
+// ── local file header: compute data offset ────────────────────────────────────
 //
-// zip.js writes entries with a data descriptor (GP bit 3 set), so the
-// compressed-size field in the LFH is always 0. We get the real compressedSize
-// from the ZipEntry returned by getEntries() (which reads the central directory).
-// We still need to read the LFH to get fnLen + exLen so we know where data begins.
+// zip.js sets GP bit 3 so the compressed-size in the LFH is 0; we get the
+// real value from getEntries().  We still need the LFH to find fnLen + exLen.
 
 async function localDataOffset(blob, lfhOffset) {
 	const buf = await blob.slice(lfhOffset, lfhOffset + 30).arrayBuffer();
@@ -49,7 +49,7 @@ async function localDataOffset(blob, lfhOffset) {
 	if (dv.getUint32(0, true) !== 0x04034b50) throw new Error("not a ZIP local file header");
 	const method = dv.getUint16(8, true);
 	const fnLen  = dv.getUint16(26, true);
-	const exLen  = dv.getUint16(28, true); // LOCAL extra length — may differ from CD
+	const exLen  = dv.getUint16(28, true);
 	return { method, dataOffset: lfhOffset + 30 + fnLen + exLen };
 }
 
@@ -58,9 +58,7 @@ async function localDataOffset(blob, lfhOffset) {
 function makeSSEResponse(handler) {
 	const enc = new TextEncoder();
 	let ctrl;
-	const readable = new ReadableStream({
-		start(c) { ctrl = c; },
-	});
+	const readable = new ReadableStream({ start(c) { ctrl = c; } });
 	const emit = (obj) => ctrl.enqueue(enc.encode(`data: ${JSON.stringify(obj)}\n\n`));
 	handler(emit)
 		.catch((err) => emit({ error: String(err) }))
@@ -72,13 +70,12 @@ function makeSSEResponse(handler) {
 
 // ── R2 multipart sink ─────────────────────────────────────────────────────────
 //
-// Buffers chunks to PART_SIZE then uploads one R2 multipart part.
-// backpressured=true  → write() returns the upload Promise (getData waits)
-// backpressured=false → write() returns undefined (getData never waits)
+// backpressured=true  → write() returns the upload Promise (caller must await)
+// backpressured=false → write() returns undefined (fire-and-forget)
 
 function makeR2Sink(mpu, { backpressured, onProduced, onConsumed, onProgress }) {
 	const parts   = [];
-	const pending = []; // in-flight upload promises (non-backpressured mode only)
+	const pending = [];
 	let buf = [], bufSize = 0, partNum = 1;
 
 	function startPart(chunks, size, num) {
@@ -111,23 +108,16 @@ function makeR2Sink(mpu, { backpressured, onProduced, onConsumed, onProgress }) 
 	});
 }
 
-// ── /run/getdata ──────────────────────────────────────────────────────────────
-//
-// Uses current npm getData() with the SAME real backpressured R2 sink as
-// runFixed.  This is the correct comparison: same sink, different zip.js build.
-// If getData() honours the WritableStream's backpressure, produced ≈ consumed
-// throughout and the chart looks like the patched panel.
-// If it ignores backpressure, produced races ahead and a backlog builds.
+// ── run handlers ──────────────────────────────────────────────────────────────
 
-async function runGetData(emit, env) {
+async function runGetData(emit, env, key) {
 	const start = Date.now();
 	const elapsed = () => (Date.now() - start) / 1000;
 	emit({ t: 0, produced: 0, consumed: 0 });
 
-	const blob      = await getZipBlob(env);
+	const blob      = await getZipBlob(env, key);
 	const zipReader = new ZipReader(new BlobReader(blob));
 	const [entry]   = await zipReader.getEntries();
-
 	let produced = 0, consumed = 0;
 
 	const outKey = `output/getdata-${Math.random().toString(36).slice(2, 8)}.bin`;
@@ -145,27 +135,18 @@ async function runGetData(emit, env) {
 	} finally {
 		await env.DATA.delete(outKey).catch(() => {});
 	}
-
 	emit({ t: elapsed(), produced: produced / 1e6, consumed: consumed / 1e6, done: true });
 	await zipReader.close();
 }
 
-// ── /run/fixed ────────────────────────────────────────────────────────────────
-//
-// Uses the patched getData() (ByteLengthQueuingStrategy on internal transforms)
-// with a REAL backpressured sink: write() returns a setTimeout Promise so the
-// drain rate is enforced. Because the fix makes getData honour backpressure,
-// it advances only as fast as the sink drains — produced tracks consumed.
-
-async function runFixed(emit, env) {
+async function runFixed(emit, env, key) {
 	const start = Date.now();
 	const elapsed = () => (Date.now() - start) / 1000;
 	emit({ t: 0, produced: 0, consumed: 0 });
 
-	const blob      = await getZipBlob(env);
+	const blob      = await getZipBlob(env, key);
 	const zipReader = new ZipReaderFixed(new BlobReaderFixed(blob));
 	const [entry]   = await zipReader.getEntries();
-
 	let produced = 0, consumed = 0;
 
 	const outKey = `output/fixed-${Math.random().toString(36).slice(2, 8)}.bin`;
@@ -183,33 +164,24 @@ async function runFixed(emit, env) {
 	} finally {
 		await env.DATA.delete(outKey).catch(() => {});
 	}
-
 	emit({ t: elapsed(), produced: produced / 1e6, consumed: consumed / 1e6, done: true });
 	await zipReader.close();
 }
 
-// ── /run/direct ───────────────────────────────────────────────────────────────
-//
-// Bypasses getData entirely. Pull-based: native DecompressionStream driven by
-// the sink. Produced and consumed track each other throughout — no backlog.
-
-async function runDirect(emit, env) {
+async function runDirect(emit, env, key) {
 	const start = Date.now();
 	const elapsed = () => (Date.now() - start) / 1000;
 	emit({ t: 0, produced: 0, consumed: 0 });
 
-	const blob = await getZipBlob(env);
-
-	const zipReader          = new ZipReader(new BlobReader(blob));
-	const [entry]            = await zipReader.getEntries();
+	const blob                   = await getZipBlob(env, key);
+	const zipReader              = new ZipReader(new BlobReader(blob));
+	const [entry]                = await zipReader.getEntries();
 	await zipReader.close();
-	const { compressedSize } = entry;
+	const { compressedSize }     = entry;
 	const { method, dataOffset } = await localDataOffset(blob, entry.offset);
-	if (method !== 8)
-		throw new Error(`unexpected compression method ${method} (expected 8 = deflate)`);
+	if (method !== 8) throw new Error(`unexpected compression method ${method} (expected deflate=8)`);
 
 	let produced = 0, consumed = 0;
-
 	const CHUNK = 64 * 1024;
 	const compressedData = blob.slice(dataOffset, dataOffset + compressedSize);
 	let offset = 0;
@@ -239,26 +211,12 @@ async function runDirect(emit, env) {
 	} finally {
 		await env.DATA.delete(outKey).catch(() => {});
 	}
-
 	emit({ t: elapsed(), produced: produced / 1e6, consumed: consumed / 1e6, done: true });
-}
-
-// ── entry metadata ────────────────────────────────────────────────────────────
-
-let _meta = null;
-async function getEntryMeta(env) {
-	if (_meta) return _meta;
-	const blob      = await getZipBlob(env);
-	const zipReader = new ZipReader(new BlobReader(blob));
-	const [entry]   = await zipReader.getEntries();
-	await zipReader.close();
-	_meta = { entryMb: Math.round(entry.uncompressedSize / 1024 / 1024) };
-	return _meta;
 }
 
 // ── HTML ──────────────────────────────────────────────────────────────────────
 
-function buildHtml(entryMb) {
+function buildHtml() {
 	return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -269,8 +227,16 @@ function buildHtml(entryMb) {
   body { font-family: ui-monospace, monospace; background: #0d1117; color: #e6edf3;
          margin: 0; padding: 32px 24px; max-width: 1200px; }
   h1   { font-size: 1rem; color: #58a6ff; margin: 0 0 6px; }
-  .sub { font-size: .8rem; color: #8b949e; margin: 0 0 28px; line-height: 1.7; }
+  .sub { font-size: .8rem; color: #8b949e; margin: 0 0 16px; line-height: 1.7; }
   .sub strong { color: #e6edf3; }
+  .file-row { display: flex; align-items: center; gap: 10px; margin-bottom: 20px;
+              font-size: .78rem; flex-wrap: wrap; }
+  .file-row label { color: #8b949e; }
+  .file-row select { background: #21262d; border: 1px solid #30363d; color: #e6edf3;
+                     padding: 4px 10px; border-radius: 4px; font-family: inherit;
+                     font-size: .78rem; cursor: pointer; min-width: 220px; }
+  .file-row select:disabled { opacity: .5; cursor: default; }
+  .file-size { color: #8b949e; font-size: .72rem; }
   .grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
   .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
   .card-title { font-size: .8rem; margin: 0 0 10px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -296,16 +262,18 @@ function buildHtml(entryMb) {
 <body>
 <h1>zip.js <code>entry.getData()</code> — backpressure demo</h1>
 <p class="sub">
-  All three runs extract a <strong>${entryMb} MB</strong> entry from the same ZIP
-  and write the decompressed bytes to the same real backpressured R2 sink.<br>
-  The gap between
+  All three runs extract the same entry and write decompressed bytes to the
+  same real backpressured R2 multipart sink.  The gap between
   <span style="color:#388bfd">produced</span> and
-  <span style="color:#3fb950">consumed</span>
-  is live memory held in the process.<br>
-  <em>Left = current npm getData() with a backpressured sink — does it respect it?
-  Middle = patched (ByteLengthQS) with same sink.
-  Right = native DecompressionStream, same sink.</em>
+  <span style="color:#3fb950">consumed</span> is live memory held in the process.<br>
+  <em>Left = current npm getData(), Middle = ByteLengthQS patch, Right = native DecompressionStream.</em>
 </p>
+
+<div class="file-row">
+  <label for="archive-sel">Archive</label>
+  <select id="archive-sel" disabled><option value="">loading…</option></select>
+  <span class="file-size" id="archive-info"></span>
+</div>
 
 <div class="grid">
   <div class="card">
@@ -345,7 +313,9 @@ function buildHtml(entryMb) {
     </p>
     <canvas id="c-direct"></canvas>
     <div class="legend">
-      <span><span class="dot" style="background:#3fb950"></span>consumed (= produced)</span>
+      <span><span class="dot" style="background:#388bfd"></span>produced</span>
+      <span><span class="dot" style="background:#3fb950"></span>consumed</span>
+      <span><span class="dot" style="background:#da3633"></span>backlog</span>
     </div>
     <div class="stat" id="stat-direct">—</div>
     <button id="btn-direct" onclick="run('direct')">Run direct</button>
@@ -359,9 +329,35 @@ function buildHtml(entryMb) {
 </div>
 
 <script>
-const ENTRY_MB = ${entryMb};
+(async function loadFiles() {
+  const sel  = document.getElementById('archive-sel');
+  const info = document.getElementById('archive-info');
+  try {
+    const files = await fetch('/files').then(r => r.json());
+    sel.innerHTML = '';
+    if (!files.length) {
+      sel.innerHTML = '<option value="">no .zip files in R2</option>';
+      return;
+    }
+    for (const f of files) {
+      const opt = document.createElement('option');
+      opt.value = f.key;
+      opt.textContent = f.key + '  (' + (f.size / 1024 / 1024).toFixed(1) + ' MB compressed)';
+      sel.appendChild(opt);
+    }
+    info.textContent = files.length + ' file' + (files.length === 1 ? '' : 's');
+  } catch (e) {
+    sel.innerHTML = '<option value="">error loading files</option>';
+    info.textContent = String(e);
+  } finally {
+    sel.disabled = false;
+  }
+})();
 
 function run(mode) {
+  const key = document.getElementById('archive-sel').value;
+  if (!key) return;
+
   const canvas = document.getElementById('c-' + mode);
   const stat   = document.getElementById('stat-' + mode);
   const btn    = document.getElementById('btn-' + mode);
@@ -375,7 +371,7 @@ function run(mode) {
   const W = canvas.width, H = canvas.height;
   const pts = [];
 
-  const es = new EventSource('/run/' + mode);
+  const es = new EventSource('/run/' + mode + '?key=' + encodeURIComponent(key));
 
   es.onmessage = ({ data }) => {
     const d = JSON.parse(data);
@@ -400,17 +396,17 @@ function run(mode) {
   function draw() {
     ctx.clearRect(0, 0, W, H);
     if (pts.length < 2) return;
-    const latest = pts[pts.length - 1];
-    const tMax  = Math.max(latest.t * 1.15, 5);
-    // 15% headroom so the produced line (often at ENTRY_MB) stays visible
-    const Y_MAX = ENTRY_MB / 0.85;
+    const latest  = pts[pts.length - 1];
+    const tMax    = Math.max(latest.t * 1.15, 5);
+    const peakMb  = pts.reduce((m, p) => Math.max(m, p.produced, p.consumed), 1);
+    const Y_MAX   = Math.max(peakMb / 0.85, 200); // always show 128 MB limit line
     const x = (t)  => (t  / tMax)  * W;
     const y = (mb) => H - (mb / Y_MAX) * H;
 
-    // grid lines at 25/50/75/100% of ENTRY_MB; 100% line in blue-tint
+    // grid lines at 25/50/75/100% of peak
     ctx.lineWidth = 1;
     for (let i = 1; i <= 4; i++) {
-      const mb = ENTRY_MB * i / 4;
+      const mb = peakMb * i / 4;
       const yy = y(mb);
       ctx.strokeStyle = i === 4 ? 'rgba(56,139,253,.25)' : '#21262d';
       ctx.beginPath(); ctx.moveTo(0, yy); ctx.lineTo(W, yy); ctx.stroke();
@@ -419,7 +415,7 @@ function run(mode) {
       ctx.fillText(mb.toFixed(0) + ' MB', 4, yy - 3);
     }
 
-    // Workers 128 MB hard memory limit
+    // Workers 128 MB memory limit
     const limitY = y(128);
     ctx.save();
     ctx.setLineDash([5 * dpr, 4 * dpr]);
@@ -431,7 +427,7 @@ function run(mode) {
     ctx.font = (9 * dpr) + 'px ui-monospace,monospace';
     ctx.fillText('128 MB workers limit', 4, limitY - 3);
 
-    // backlog fill (produced - consumed) — red
+    // backlog fill
     ctx.beginPath();
     ctx.moveTo(x(pts[0].t), y(pts[0].produced));
     for (const p of pts) ctx.lineTo(x(p.t), y(p.produced));
@@ -440,7 +436,7 @@ function run(mode) {
     ctx.fillStyle = 'rgba(218,54,51,.35)';
     ctx.fill();
 
-    // consumed area — green
+    // consumed area
     ctx.beginPath();
     ctx.moveTo(x(pts[0].t), H);
     for (const p of pts) ctx.lineTo(x(p.t), y(p.consumed));
@@ -449,13 +445,13 @@ function run(mode) {
     ctx.fillStyle = 'rgba(63,185,80,.25)';
     ctx.fill();
 
-    // produced line — blue (drawn after fills so it's on top)
+    // produced line
     ctx.beginPath();
     ctx.moveTo(x(pts[0].t), y(pts[0].produced));
     for (const p of pts) ctx.lineTo(x(p.t), y(p.produced));
     ctx.strokeStyle = '#388bfd'; ctx.lineWidth = 2; ctx.stroke();
 
-    // consumed line — green
+    // consumed line
     ctx.beginPath();
     ctx.moveTo(x(pts[0].t), y(pts[0].consumed));
     for (const p of pts) ctx.lineTo(x(p.t), y(p.consumed));
@@ -471,14 +467,25 @@ function run(mode) {
 
 export default {
 	async fetch(request, env) {
-		const { pathname } = new URL(request.url);
+		const url      = new URL(request.url);
+		const { pathname } = url;
+
 		if (pathname === "/") {
-			const { entryMb } = await getEntryMeta(env);
-			return new Response(buildHtml(entryMb), { headers: { "Content-Type": "text/html" } });
+			return new Response(buildHtml(), { headers: { "Content-Type": "text/html" } });
 		}
-		if (pathname === "/run/getdata") return makeSSEResponse((emit) => runGetData(emit, env));
-		if (pathname === "/run/fixed")   return makeSSEResponse((emit) => runFixed(emit, env));
-		if (pathname === "/run/direct")  return makeSSEResponse((emit) => runDirect(emit, env));
-return new Response("Not found", { status: 404 });
+
+		if (pathname === "/files") {
+			const files = await listZipFiles(env);
+			return new Response(JSON.stringify(files), {
+				headers: { "Content-Type": "application/json", "Cache-Control": "no-cache" },
+			});
+		}
+
+		const key = url.searchParams.get("key") || "large.zip";
+		if (pathname === "/run/getdata") return makeSSEResponse((emit) => runGetData(emit, env, key));
+		if (pathname === "/run/fixed")   return makeSSEResponse((emit) => runFixed(emit, env, key));
+		if (pathname === "/run/direct")  return makeSSEResponse((emit) => runDirect(emit, env, key));
+
+		return new Response("Not found", { status: 404 });
 	},
 };
